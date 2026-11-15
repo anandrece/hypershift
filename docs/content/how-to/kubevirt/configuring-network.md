@@ -135,3 +135,11 @@ hcp create cluster kubevirt \
 
 By following these guidelines, you can ensure successful deployment of guest clusters, avoid network CIDR collisions,
 and prevent DNS-related issues between hosting and guest clusters.
+
+## LoadBalancer externalTrafficPolicy
+
+A hosted `LoadBalancer` Service is published as a mirror Service on the management cluster. That mirror Service gets the hosted Service's `spec.externalTrafficPolicy`.
+
+`Cluster` publishes an endpoint for every hosted worker. `Local` publishes an endpoint only for a worker that has a ready local pod, and MetalLB sends traffic only to the management node running that worker. Traffic is not sent to a worker that would refuse it because the pod is running somewhere else.
+
+On the default pod network, the packet is still source-translated before it reaches the workload. `externalTrafficPolicy: Local` does not preserve the original client address in this topology. Preserving that address requires a routable secondary network on the worker VMs.

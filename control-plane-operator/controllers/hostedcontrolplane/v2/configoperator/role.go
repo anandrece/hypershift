@@ -65,6 +65,15 @@ func adaptRole(cpContext component.WorkloadContext, role *rbacv1.Role) error {
 				APIGroups: []string{
 					"kubevirt.io",
 				},
+				Resources: []string{"virtualmachineinstances"},
+				// NodeName on the VirtualMachineInstance selects the management
+				// node that can receive externalTrafficPolicy Local traffic.
+				Verbs: []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{
+					"kubevirt.io",
+				},
 				Resources: []string{"virtualmachines/finalizers"},
 				Verbs:     []string{"update"},
 			},

@@ -338,6 +338,52 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
 		return kccmEndpointSliceIPv4WithNamespace("ns1", machine, vm)
 	}
 
+	kccmTrafficPolicyEndpointSlice := func(machine capiv1.Machine, vm kubevirtv1.VirtualMachine, ipFamily corev1.IPFamily, address, nodeName string) discoveryv1.EndpointSlice {
+		family := "ipv4"
+		addressType := discoveryv1.AddressTypeIPv4
+		if ipFamily == corev1.IPv6Protocol {
+			family = "ipv6"
+			addressType = discoveryv1.AddressTypeIPv6
+		}
+		endpoints := []discoveryv1.Endpoint{}
+		if address != "" {
+			endpoints = []discoveryv1.Endpoint{{
+				Addresses: []string{address},
+				NodeName:  ptr.To(nodeName),
+				Conditions: discoveryv1.EndpointConditions{
+					Ready:       ptr.To(true),
+					Serving:     ptr.To(true),
+					Terminating: ptr.To(false),
+				},
+			}}
+		}
+		return discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns1",
+				Name:      "kccm-service-cluster1-" + machine.Name + "-" + family,
+				Labels: map[string]string{
+					discoveryv1.LabelServiceName: "kccm-service-cluster1",
+					discoveryv1.LabelManagedBy:   "control-plane-operator.hypershift.openshift.io",
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion:         vmTypeMeta.APIVersion,
+					Kind:               vmTypeMeta.Kind,
+					UID:                vm.UID,
+					Name:               vm.Name,
+					Controller:         ptr.To(true),
+					BlockOwnerDeletion: ptr.To(true),
+				}},
+			},
+			AddressType: addressType,
+			Endpoints:   endpoints,
+			Ports: []discoveryv1.EndpointPort{{
+				Port:     ptr.To[int32](4444),
+				Protocol: &protocolTCP,
+				Name:     ptr.To("port1"),
+			}},
+		}
+	}
+
 	kccmEndpointSliceIPv6 := func(machine capiv1.Machine, vm kubevirtv1.VirtualMachine) discoveryv1.EndpointSlice {
 		return discoveryv1.EndpointSlice{
 			ObjectMeta: metav1.ObjectMeta{
@@ -461,12 +507,63 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
 		},
 	}
 
+	localTrafficMachines := pairOfDualStackMachines(capiv1.MachinePhaseRunning, capiv1.MachinePhaseRunning)
+	localTrafficMachines[0].Status.NodeRef = capiv1.MachineNodeReference{Name: "guest-worker-1"}
+	localTrafficMachines[1].Status.NodeRef = capiv1.MachineNodeReference{Name: "guest-worker-2"}
+	localTrafficVMIs := []kubevirtv1.VirtualMachineInstance{
+		{
+			ObjectMeta: vmWorker1Meta,
+			Status:     kubevirtv1.VirtualMachineInstanceStatus{NodeName: "infra-worker-1"},
+		},
+		{
+			ObjectMeta: vmWorker2Meta,
+			Status:     kubevirtv1.VirtualMachineInstanceStatus{NodeName: "infra-worker-2"},
+		},
+	}
+	tenantMirrorService := func(policy corev1.ServiceExternalTrafficPolicy) corev1.Service {
+		service := kccmService
+		service.Labels = map[string]string{
+			tenantServiceNameLabelKey:      "svc-3",
+			tenantServiceNamespaceLabelKey: "app",
+			clusterNameLabelKey:            "cluster1",
+		}
+		service.Spec.ExternalTrafficPolicy = policy
+		return service
+	}
+	tenantGuestService := func(policy corev1.ServiceExternalTrafficPolicy) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "svc-3"},
+			Spec: corev1.ServiceSpec{
+				Type:                  corev1.ServiceTypeLoadBalancer,
+				ExternalTrafficPolicy: policy,
+			},
+		}
+	}
+	localGuestEndpointSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "app",
+			Name:      "svc-3-ipv4",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "svc-3"},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses: []string{"10.132.0.20"},
+			NodeName:  ptr.To("guest-worker-1"),
+			Conditions: discoveryv1.EndpointConditions{
+				Ready:   ptr.To(true),
+				Serving: ptr.To(true),
+			},
+		}},
+	}
+
 	testCases := []struct {
 		name                          string
 		machines                      []capiv1.Machine
 		virtualMachines               []kubevirtv1.VirtualMachine
+		virtualMachineInstances       []kubevirtv1.VirtualMachineInstance
 		services                      []corev1.Service
 		endpointSlices                []discoveryv1.EndpointSlice
+		guestObjects                  []client.Object
 		hcp                           *hyperv1.HostedControlPlane
 		expectedIngressEndpointSlices []discoveryv1.EndpointSlice
 		expectedServices              []corev1.Service
@@ -572,6 +669,42 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
 			},
 			hcp: kubevirtHCP,
 		},
+		{
+			name:                    "When a tenant LoadBalancer uses externalTrafficPolicy Local, it should publish Local and only the worker with a local endpoint",
+			machines:                localTrafficMachines,
+			virtualMachines:         pairOfVirtualMachines,
+			virtualMachineInstances: localTrafficVMIs,
+			services:                []corev1.Service{tenantMirrorService("")},
+			guestObjects: []client.Object{
+				tenantGuestService(corev1.ServiceExternalTrafficPolicyLocal),
+				localGuestEndpointSlice,
+			},
+			expectedServices: []corev1.Service{tenantMirrorService(corev1.ServiceExternalTrafficPolicyLocal)},
+			expectedIngressEndpointSlices: []discoveryv1.EndpointSlice{
+				kccmTrafficPolicyEndpointSlice(localTrafficMachines[0], pairOfVirtualMachines[0], corev1.IPv4Protocol, addressesByMachine[worker1Meta.Name][0], "infra-worker-1"),
+				kccmTrafficPolicyEndpointSlice(localTrafficMachines[0], pairOfVirtualMachines[0], corev1.IPv6Protocol, addressesByMachine[worker1Meta.Name][1], "infra-worker-1"),
+				kccmTrafficPolicyEndpointSlice(localTrafficMachines[1], pairOfVirtualMachines[1], corev1.IPv4Protocol, "", ""),
+				kccmTrafficPolicyEndpointSlice(localTrafficMachines[1], pairOfVirtualMachines[1], corev1.IPv6Protocol, "", ""),
+			},
+			hcp: kubevirtHCP,
+		},
+		{
+			name:            "When a tenant LoadBalancer uses externalTrafficPolicy Cluster, it should publish Cluster and keep every worker endpoint",
+			machines:        pairOfDualStackRunningMachines,
+			virtualMachines: pairOfVirtualMachines,
+			services:        []corev1.Service{tenantMirrorService(corev1.ServiceExternalTrafficPolicyLocal)},
+			guestObjects: []client.Object{
+				tenantGuestService(corev1.ServiceExternalTrafficPolicyCluster),
+			},
+			expectedServices: []corev1.Service{tenantMirrorService(corev1.ServiceExternalTrafficPolicyCluster)},
+			expectedIngressEndpointSlices: []discoveryv1.EndpointSlice{
+				kccmEndpointSliceIPv4(pairOfDualStackRunningMachines[0], pairOfVirtualMachines[0]),
+				kccmEndpointSliceIPv4(pairOfDualStackRunningMachines[1], pairOfVirtualMachines[1]),
+				kccmEndpointSliceIPv6(pairOfDualStackRunningMachines[0], pairOfVirtualMachines[0]),
+				kccmEndpointSliceIPv6(pairOfDualStackRunningMachines[1], pairOfVirtualMachines[1]),
+			},
+			hcp: kubevirtHCP,
+		},
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -581,6 +714,10 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
 			for _, vm := range tc.virtualMachines {
 				virtualMachine := vm // golang bug referencing for loop vars
 				kubevirtInfraClusterObjects = append(kubevirtInfraClusterObjects, &virtualMachine)
+			}
+			for _, vmi := range tc.virtualMachineInstances {
+				instance := vmi
+				kubevirtInfraClusterObjects = append(kubevirtInfraClusterObjects, &instance)
 			}
 			for _, svc := range tc.services {
 				service := svc // golang bug referencing for loop vars
@@ -599,6 +736,7 @@ func TestReconcileDefaultIngressEndpoints(t *testing.T) {
 			r := &reconciler{
 				client:                 fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(mgmtClusterObjects...).Build(),
 				kubevirtInfraClient:    fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(kubevirtInfraClusterObjects...).Build(),
+				guestClient:            fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(tc.guestObjects...).Build(),
 				CreateOrUpdateProvider: &simpleCreateOrUpdater{},
 			}
 			if tc.hcp != nil {
@@ -650,4 +788,77 @@ func resetResourceVersionFromEndpointSlices(endpointSlices []discoveryv1.Endpoin
 		endpointSlices[i].ResourceVersion = ""
 	}
 	return endpointSlices
+}
+
+func TestNodeHasReadyEndpoint(t *testing.T) {
+	ready := func(nodeName string, ready, serving, terminating *bool) discoveryv1.Endpoint {
+		return discoveryv1.Endpoint{
+			Addresses: []string{"10.132.0.20"},
+			NodeName:  &nodeName,
+			Conditions: discoveryv1.EndpointConditions{
+				Ready:       ready,
+				Serving:     serving,
+				Terminating: terminating,
+			},
+		}
+	}
+	slices := func(endpoints ...discoveryv1.Endpoint) []discoveryv1.EndpointSlice {
+		return []discoveryv1.EndpointSlice{{Endpoints: endpoints}}
+	}
+
+	testCases := []struct {
+		name     string
+		slices   []discoveryv1.EndpointSlice
+		nodeName string
+		want     bool
+	}{
+		{
+			name:     "When a ready endpoint is on the node, it should match",
+			slices:   slices(ready("guest-worker-1", ptr.To(true), ptr.To(true), ptr.To(false))),
+			nodeName: "guest-worker-1",
+			want:     true,
+		},
+		{
+			name:     "When endpoint conditions are unset, it should match",
+			slices:   slices(ready("guest-worker-1", nil, nil, nil)),
+			nodeName: "guest-worker-1",
+			want:     true,
+		},
+		{
+			name:     "When the endpoint is on another node, it should not match",
+			slices:   slices(ready("guest-worker-2", ptr.To(true), ptr.To(true), nil)),
+			nodeName: "guest-worker-1",
+			want:     false,
+		},
+		{
+			name:     "When the endpoint is not ready, it should not match",
+			slices:   slices(ready("guest-worker-1", ptr.To(false), ptr.To(true), ptr.To(false))),
+			nodeName: "guest-worker-1",
+			want:     false,
+		},
+		{
+			name:     "When the endpoint is not serving, it should not match",
+			slices:   slices(ready("guest-worker-1", ptr.To(true), ptr.To(false), ptr.To(false))),
+			nodeName: "guest-worker-1",
+			want:     false,
+		},
+		{
+			name:     "When the endpoint is terminating, it should not match",
+			slices:   slices(ready("guest-worker-1", ptr.To(true), ptr.To(true), ptr.To(true))),
+			nodeName: "guest-worker-1",
+			want:     false,
+		},
+		{
+			name:     "When the node name is empty, it should not match",
+			slices:   slices(ready("guest-worker-1", ptr.To(true), ptr.To(true), nil)),
+			nodeName: "",
+			want:     false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			g.Expect(nodeHasReadyEndpoint(tc.slices, tc.nodeName)).To(Equal(tc.want))
+		})
+	}
 }

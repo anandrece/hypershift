@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -29,14 +30,18 @@ import (
 )
 
 const (
-	tenantServiceNameLabelKey = "cluster.x-k8s.io/tenant-service-name"
-	clusterNameLabelKey       = "cluster.x-k8s.io/cluster-name"
+	tenantServiceNameLabelKey      = "cluster.x-k8s.io/tenant-service-name"
+	tenantServiceNamespaceLabelKey = "cluster.x-k8s.io/tenant-service-namespace"
+	clusterNameLabelKey            = "cluster.x-k8s.io/cluster-name"
 )
 
 type reconciler struct {
 	client              client.Client
 	kubevirtInfraClient client.Client
-	hcpKey              client.ObjectKey
+	// guestClient reads tenant Services and EndpointSlices. Those objects are
+	// not labeled for the HCCO cache, so this client must not use that cache.
+	guestClient client.Client
+	hcpKey      client.ObjectKey
 	upsert.CreateOrUpdateProvider
 }
 
@@ -96,9 +101,28 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
 	if err != nil {
 		return fmt.Errorf("failed to create kubevirt infra uncached client: %w", err)
 	}
+	if opts.TargetConfig == nil {
+		return fmt.Errorf("kubevirt machine controller requires a guest cluster config")
+	}
+	guestScheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(guestScheme)
+	_ = discoveryv1.AddToScheme(guestScheme)
+	guestCache, err := cache.New(opts.TargetConfig, cache.Options{Scheme: guestScheme})
+	if err != nil {
+		return fmt.Errorf("failed building guest cluster cache: %w", err)
+	}
+	guestClient, err := client.New(opts.TargetConfig, client.Options{
+		Scheme: guestScheme,
+		Cache:  &client.CacheOptions{Reader: guestCache},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create guest cluster client: %w", err)
+	}
+
 	r := &reconciler{
 		client:                 opts.CPCluster.GetClient(),
 		kubevirtInfraClient:    kubevirtInfraClient,
+		guestClient:            guestClient,
 		hcpKey:                 hcpKey,
 		CreateOrUpdateProvider: opts.TargetCreateOrUpdateProvider,
 	}
@@ -147,6 +171,45 @@ func Setup(ctx context.Context, opts *operator.HostedClusterConfigOperatorConfig
 	})
 	if err := c.Watch(source.Kind[client.Object](kubevirtInfraCache, &corev1.Service{}, handler.EnqueueRequestsFromMapFunc(allNodes), isKCCMService)); err != nil {
 		return fmt.Errorf("failed to watch kubevirt services: %w", err)
+	}
+	// A live migration changes the node that must receive Local traffic.
+	if err := c.Watch(source.Kind[client.Object](kubevirtInfraCache, &kubevirtv1.VirtualMachineInstance{}, handler.EnqueueRequestsFromMapFunc(allNodes))); err != nil {
+		return fmt.Errorf("failed to watch kubevirt virtual machine instances: %w", err)
+	}
+
+	go func() {
+		_ = guestCache.Start(ctx)
+	}()
+	isGuestLoadBalancer := predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		service, ok := obj.(*corev1.Service)
+		return ok && service.Spec.Type == corev1.ServiceTypeLoadBalancer
+	})
+	if err := c.Watch(source.Kind[client.Object](guestCache, &corev1.Service{}, handler.EnqueueRequestsFromMapFunc(allNodes), isGuestLoadBalancer)); err != nil {
+		return fmt.Errorf("failed to watch guest load balancer services: %w", err)
+	}
+	enqueueLocalTenantEndpoints := func(watchContext context.Context, obj client.Object) []reconcile.Request {
+		slice, ok := obj.(*discoveryv1.EndpointSlice)
+		if !ok {
+			return nil
+		}
+		serviceName := slice.Labels[discoveryv1.LabelServiceName]
+		if serviceName == "" {
+			return nil
+		}
+		tenantService := &corev1.Service{}
+		if err := guestClient.Get(watchContext, client.ObjectKey{Namespace: slice.Namespace, Name: serviceName}, tenantService); err != nil {
+			if !apierrors.IsNotFound(err) {
+				log.Error(err, "failed to get guest service for endpoint slice", "endpointSlice", slice.Name)
+			}
+			return nil
+		}
+		if tenantService.Spec.Type != corev1.ServiceTypeLoadBalancer || tenantService.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+			return nil
+		}
+		return allNodes(watchContext, obj)
+	}
+	if err := c.Watch(source.Kind[client.Object](guestCache, &discoveryv1.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(enqueueLocalTenantEndpoints))); err != nil {
+		return fmt.Errorf("failed to watch guest endpoint slices: %w", err)
 	}
 
 	return nil

@@ -115,6 +115,26 @@ func (r *reconciler) reconcileKubevirtPassthroughService(ctx context.Context, _ 
 		return fmt.Errorf("failed to get Machine: %w", err)
 	}
 
+	// Cluster policy publishes every worker. Local publishes only the worker
+	// that has a ready tenant endpoint, and records the management node that
+	// runs that worker so MetalLB and kube-proxy keep the traffic there.
+	// The default pod network still translates the client source address, so
+	// Local does not preserve that address on this topology.
+	includeEndpoint := true
+	endpointNodeName := ""
+	if tenantNamespace, tenantName, ok := tenantServiceIdentity(cpService); ok {
+		policy, synced, err := r.syncMirrorExternalTrafficPolicy(ctx, cpService, tenantNamespace, tenantName)
+		if err != nil {
+			return err
+		}
+		if synced && policy == corev1.ServiceExternalTrafficPolicyLocal {
+			includeEndpoint, endpointNodeName, err = r.localMirrorBackend(ctx, machine, cpService.Namespace, tenantNamespace, tenantName)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	ipv4MachineAddresses := []string{}
 	ipv6MachineAddresses := []string{}
 	ports := []discoveryv1.EndpointPort{}
@@ -146,6 +166,10 @@ func (r *reconciler) reconcileKubevirtPassthroughService(ctx context.Context, _ 
 			}
 		}
 	}
+	if !includeEndpoint {
+		ipv4MachineAddresses = nil
+		ipv6MachineAddresses = nil
+	}
 	for _, port := range cpService.Spec.Ports {
 		ports = append(ports, discoveryv1.EndpointPort{
 			Name:     &port.Name,
@@ -162,7 +186,7 @@ func (r *reconciler) reconcileKubevirtPassthroughService(ctx context.Context, _ 
 		if !serviceHasIPFamily(cpService, ipFamily) {
 			continue
 		}
-		err := r.reconcileKubevirtPassthroughServiceEndpointsByIPFamily(ctx, machine, cpService, ipFamily, ipAddressesByFamily[ipFamily], ports)
+		err := r.reconcileKubevirtPassthroughServiceEndpointsByIPFamily(ctx, machine, cpService, ipFamily, ipAddressesByFamily[ipFamily], ports, endpointNodeName)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
 				log.Info(fmt.Sprintf("waiting for kubevirt VM to be created before processing default ingress %s endpoints", ipFamily))
@@ -175,7 +199,7 @@ func (r *reconciler) reconcileKubevirtPassthroughService(ctx context.Context, _ 
 	return nil
 }
 
-func (r *reconciler) reconcileKubevirtPassthroughServiceEndpointsByIPFamily(ctx context.Context, machine *capiv1.Machine, cpService *corev1.Service, ipFamily corev1.IPFamily, machineAddresses []string, ports []discoveryv1.EndpointPort) error {
+func (r *reconciler) reconcileKubevirtPassthroughServiceEndpointsByIPFamily(ctx context.Context, machine *capiv1.Machine, cpService *corev1.Service, ipFamily corev1.IPFamily, machineAddresses []string, ports []discoveryv1.EndpointPort, endpointNodeName string) error {
 	log := ctrl.LoggerFrom(ctx)
 	endpointSlice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
@@ -207,10 +231,14 @@ func (r *reconciler) reconcileKubevirtPassthroughServiceEndpointsByIPFamily(ctx 
 		endpointSlice.Labels[discoveryv1.LabelManagedBy] = managedByValue
 		endpointSlice.AddressType = discoveryv1.AddressType(ipFamily)
 		if len(machineAddresses) > 0 {
-			endpointSlice.Endpoints = []discoveryv1.Endpoint{{
+			endpoint := discoveryv1.Endpoint{
 				Addresses:  machineAddresses,
 				Conditions: machinePhaseToEndpointConditions(machine),
-			}}
+			}
+			if endpointNodeName != "" {
+				endpoint.NodeName = ptr.To(endpointNodeName)
+			}
+			endpointSlice.Endpoints = []discoveryv1.Endpoint{endpoint}
 		} else {
 			endpointSlice.Endpoints = []discoveryv1.Endpoint{}
 		}
@@ -264,6 +292,131 @@ func (r *reconciler) removeOrphanKubevirtPassthroughEndpointSlices(ctx context.C
 		}
 	}
 	return nil
+}
+
+// tenantServiceIdentity returns the hosted Service published by this mirror.
+// The cloud controller manager copies both labels when it creates the mirror.
+// Mirrors created before the namespace label existed keep the previous
+// behavior of publishing every worker.
+func tenantServiceIdentity(service *corev1.Service) (string, string, bool) {
+	if len(service.Labels) == 0 {
+		return "", "", false
+	}
+	name := service.Labels[tenantServiceNameLabelKey]
+	namespace := service.Labels[tenantServiceNamespaceLabelKey]
+	if name == "" || namespace == "" {
+		return "", "", false
+	}
+	return namespace, name, true
+}
+
+// syncMirrorExternalTrafficPolicy copies the hosted Service policy onto the
+// management mirror. The cloud controller manager sets the policy only when
+// it creates the mirror, so a later change to Local otherwise stays Cluster.
+func (r *reconciler) syncMirrorExternalTrafficPolicy(ctx context.Context, mirror *corev1.Service, tenantNamespace, tenantName string) (corev1.ServiceExternalTrafficPolicy, bool, error) {
+	if r.guestClient == nil {
+		return "", false, fmt.Errorf("guest client is not configured")
+	}
+	tenantService := &corev1.Service{}
+	if err := r.guestClient.Get(ctx, client.ObjectKey{Namespace: tenantNamespace, Name: tenantName}, tenantService); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("failed to get tenant service %s/%s: %w", tenantNamespace, tenantName, err)
+	}
+	desired := normalizeExternalTrafficPolicy(tenantService.Spec.ExternalTrafficPolicy)
+	if normalizeExternalTrafficPolicy(mirror.Spec.ExternalTrafficPolicy) == desired {
+		return desired, true, nil
+	}
+	mirror.Spec.ExternalTrafficPolicy = desired
+	if err := r.kubevirtInfraClient.Update(ctx, mirror); err != nil {
+		return "", false, fmt.Errorf("failed to update mirror service %s/%s externalTrafficPolicy: %w", mirror.Namespace, mirror.Name, err)
+	}
+	ctrl.LoggerFrom(ctx).Info("Updated mirror service externalTrafficPolicy", "service", client.ObjectKeyFromObject(mirror), "policy", desired)
+	return desired, true, nil
+}
+
+func normalizeExternalTrafficPolicy(policy corev1.ServiceExternalTrafficPolicy) corev1.ServiceExternalTrafficPolicy {
+	if policy == corev1.ServiceExternalTrafficPolicyLocal {
+		return corev1.ServiceExternalTrafficPolicyLocal
+	}
+	return corev1.ServiceExternalTrafficPolicyCluster
+}
+
+// localMirrorBackend reports whether this Machine should receive Local
+// traffic and which management node runs its VirtualMachineInstance.
+// An endpoint without that node is not local to any kube-proxy, so MetalLB
+// would stop announcing the address.
+func (r *reconciler) localMirrorBackend(ctx context.Context, machine *capiv1.Machine, infraNamespace, tenantNamespace, tenantName string) (bool, string, error) {
+	log := ctrl.LoggerFrom(ctx)
+	nodeName := machine.Status.NodeRef.Name
+	if nodeName == "" {
+		log.Info("Skipping Local externalTrafficPolicy endpoint until the Machine has a node reference", "machine", machine.Name)
+		return false, "", nil
+	}
+	slices := &discoveryv1.EndpointSliceList{}
+	if err := r.guestClient.List(ctx, slices,
+		client.InNamespace(tenantNamespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: tenantName},
+	); err != nil {
+		return false, "", fmt.Errorf("failed to list tenant endpoint slices for %s/%s: %w", tenantNamespace, tenantName, err)
+	}
+	if !nodeHasReadyEndpoint(slices.Items, nodeName) {
+		return false, "", nil
+	}
+	infraNode, err := r.virtualMachineInstanceNodeName(ctx, infraNamespace, machine.Spec.InfrastructureRef.Name)
+	if err != nil {
+		return false, "", err
+	}
+	if infraNode == "" {
+		log.Info("Skipping Local externalTrafficPolicy endpoint until the VirtualMachineInstance has a node", "machine", machine.Name)
+		return false, "", nil
+	}
+	return true, infraNode, nil
+}
+
+func (r *reconciler) virtualMachineInstanceNodeName(ctx context.Context, namespace, name string) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	vmi := &kubevirtv1.VirtualMachineInstance{}
+	if err := r.kubevirtInfraClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, vmi); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to get VirtualMachineInstance %s/%s: %w", namespace, name, err)
+	}
+	return vmi.Status.NodeName, nil
+}
+
+func nodeHasReadyEndpoint(slices []discoveryv1.EndpointSlice, nodeName string) bool {
+	if nodeName == "" {
+		return false
+	}
+	for i := range slices {
+		for _, endpoint := range slices[i].Endpoints {
+			if endpoint.NodeName == nil || *endpoint.NodeName != nodeName {
+				continue
+			}
+			if endpointAcceptsTraffic(endpoint) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func endpointAcceptsTraffic(endpoint discoveryv1.Endpoint) bool {
+	if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+		return false
+	}
+	if endpoint.Conditions.Serving != nil && !*endpoint.Conditions.Serving {
+		return false
+	}
+	if endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating {
+		return false
+	}
+	return len(endpoint.Addresses) > 0
 }
 
 func machinePhaseToEndpointConditions(machine *capiv1.Machine) discoveryv1.EndpointConditions {
